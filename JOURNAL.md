@@ -30,3 +30,38 @@
 - Why does QLoRA's double quantization save bits — what exactly gets quantized twice?
 - What's the difference between fp16 compute dtype and the 4-bit storage dtype during forward pass?
 - For GRPO's KL penalty β=0.04 — what's the math behind this specific value?
+
+## Day 2 — [today's date]
+
+**Goal:** Prepare OpenR1-Math-220k for SFT training.
+
+**Key dataset findings:**
+- Dataset has 2 R1-generated reasoning traces per problem; majority pass 
+  `correctness_math_verify`
+- Reasoning traces are LONG — median 4843 tokens, p90 11.7K, max 19K
+- All traces use `<think>...</think>` then final `\boxed{answer}` structure 
+  (DeepSeek-R1 distillation format)
+- `messages` field already chat-formatted, applies cleanly to Qwen tokenizer
+
+**Engineering decisions:**
+- **Quality filter:** kept examples where `correctness_math_verify` was True, 
+  fell back to `correctness_llama` when math verify was unavailable
+- **Generation expansion:** treated each verified-correct trace as a separate 
+  training example — expanded from ~94K filtered problems to 124K training rows
+- **MAX_TOKENS = 4096:** deliberate tradeoff. p50 of traces is 4843 tokens, 
+  so cap retains 41.6% of expanded examples (~52K). Going to 8192 would 
+  retain ~85% but make a single epoch unfit in a 9hr Kaggle session. 
+  4096 keeps 1 epoch at ~5-6 hours while preserving 51.8K high-quality examples 
+  — far more than the 20K we plan to train on.
+- **Single-process tokenization:** dropped `num_proc=4` after OOM. Kaggle's 
+  ~13GB system RAM can't hold 4 worker copies of long-trace tokenization. 
+  Single-process is ~5x slower but stable.
+
+**Final dataset:** 19,600 train / 400 val, saved to `/kaggle/working/`
+
+**Open questions:**
+- How will SFT loss curve look? Expect rapid initial drop (format learning), 
+  then slower decline (reasoning learning).
+- Will the model overfit on 19.6K examples for 1 epoch?
+- What's the right learning rate? 2e-4 is QLoRA default; may need adjustment 
+  for long-context training.

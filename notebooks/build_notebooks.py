@@ -428,6 +428,110 @@ print("\ndownload: results.zip, grpo_a_adapter.zip, grpo_a_logs.zip")
     save("06-grpo-base.ipynb", cells)
 
 
+def build_07():
+    cells = [
+        md("# 07 - Sample base 8x on GSM8K train"),
+        md("## 1. Installations"),
+        INSTALL,
+        md("## 2. Environment check"),
+        ENV,
+        md("## 3. Shared extractor + eval helpers"),
+        writefile("rf_extract.py"),
+        writefile("rf_eval.py"),
+        md("## 4. Config"),
+        code(r"""
+import glob, os, shutil
+
+MODEL_ID    = "Qwen/Qwen2.5-1.5B-Instruct"
+K           = 8
+TEMPERATURE = 1.0
+MAX_NEW     = 1024
+CHUNK       = 500
+N_LIMIT     = None
+OUT_DIR     = "/kaggle/working/samples"
+OUT         = f"{OUT_DIR}/gsm8k_train_k{K}.pkl"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+for p in glob.glob("/kaggle/input/**/samples/*.pkl", recursive=True):
+    dst = os.path.join(OUT_DIR, os.path.basename(p))
+    if not os.path.exists(dst):
+        shutil.copy(p, dst); print("resuming from", p)
+"""),
+        md("## 5. Load vLLM"),
+        code(r"""
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model=MODEL_ID,
+    dtype="half",
+    max_model_len=MAX_NEW + 512,
+    gpu_memory_utilization=0.85,
+    seed=0,
+)
+tokenizer = llm.get_tokenizer()
+
+GREEDY = SamplingParams(temperature=0.0, max_tokens=MAX_NEW, repetition_penalty=1.0)
+SAMPLED = SamplingParams(n=K, temperature=TEMPERATURE, top_p=1.0, max_tokens=MAX_NEW,
+                         repetition_penalty=1.0, seed=0)
+"""),
+        md("## 6. Generate"),
+        code(r"""
+import time
+from rf_eval import gsm8k_train, chat_prompts, sample_rows, sample_summary, load_result, save_result
+
+items = gsm8k_train()
+if N_LIMIT:
+    items = items[:N_LIMIT]
+
+result = load_result(OUT, {"dataset": "gsm8k_train", "style": "boxed", "n": len(items), "k": K,
+                           "temperature": TEMPERATURE, "max_new": MAX_NEW, "model_id": MODEL_ID})
+rows = result.setdefault("rows", [])
+print(f"{len(rows)}/{len(items)} problems already done")
+
+t0 = time.time()
+for start in range(len(rows), len(items), CHUNK):
+    chunk = items[start:start + CHUNK]
+    prompts = chat_prompts(tokenizer, chunk, "boxed")
+    greedy = llm.generate(prompts, GREEDY)
+    sampled = llm.generate(prompts, SAMPLED)
+    rows.extend(sample_rows(chunk, greedy, sampled))
+    save_result(OUT, result)
+    s = sample_summary(rows)
+    print(f"[{len(rows)}/{len(items)}] greedy {s['greedy']*100:.1f}%  pass@{K} {s['pass_any']*100:.1f}%  "
+          f"mixed {s['mixed']*100:.1f}%  ({(time.time()-t0)/60:.0f} min)", flush=True)
+"""),
+        md("## 7. Summary"),
+        code(r"""
+import json
+
+summary = {}
+for split in ["train", "dev"]:
+    part = [r for r in rows if r["split"] == split]
+    if not part:
+        continue
+    s = summary[split] = sample_summary(part)
+    print(f"\n{split} (n={s['n']})")
+    print(f"  greedy            {s['greedy']*100:5.1f}%")
+    print(f"  mean of samples   {s['sample_mean']*100:5.1f}%")
+    print(f"  majority@{K}        {s['majority']*100:5.1f}%")
+    print(f"  pass@{K}            {s['pass_any']*100:5.1f}%")
+    print(f"  mixed (1..{K-1} of {K}) {s['mixed']*100:5.1f}%")
+    print(f"  truncated {s['truncated']*100:.1f}%  looping {s['looping']*100:.1f}%  median tokens {s['median_tokens']}")
+    print("  correct out of", K, ":", "  ".join(f"{i}:{c}" for i, c in enumerate(s["hist"])))
+
+with open(f"{OUT_DIR}/summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+"""),
+        md("## 8. Package for download"),
+        code(r"""
+shutil.make_archive("/kaggle/working/samples", "zip", "/kaggle/working", "samples")
+print("download /kaggle/working/samples.zip from the Output panel")
+"""),
+    ]
+    save("07-sample-base.ipynb", cells)
+
+
 if __name__ == "__main__":
     build_05()
     build_06()
+    build_07()

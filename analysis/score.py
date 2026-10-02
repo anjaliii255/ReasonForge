@@ -73,6 +73,20 @@ def report(path):
         print(f"{name:8s} wrong={tot}  truncated={trunc}  no-box={nobox}  genuine-error={genuine}  "
               f"| ceiling if truncations recovered: {(sum(scored[name]) + trunc) / n * 100:.1f}%")
 
+    for key in ("subject", "level"):
+        if not all(key in r for recs in models.values() for r in recs):
+            continue
+        print(f"\n=== accuracy by {key} ===")
+        first = next(iter(models.values()))
+        groups = sorted({r[key] for r in first})
+        print(f"{key:24s} {'n':>4s}  " + "  ".join(f"{name:>8s}" for name in models))
+        for g in groups:
+            cols = []
+            for name, recs in models.items():
+                idx = [i for i, r in enumerate(recs) if r[key] == g]
+                cols.append(f"{sum(scored[name][i] for i in idx) / len(idx) * 100:7.1f}%")
+            print(f"{str(g):24s} {len(idx):4d}  " + "  ".join(cols))
+
     print("\n=== format / verbosity ===")
     for name, recs in models.items():
         n = len(recs)

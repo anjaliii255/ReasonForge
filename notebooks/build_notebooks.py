@@ -199,7 +199,7 @@ print("download /kaggle/working/results.zip from the Output panel")
 
 def build_06():
     cells = [
-        md("# 06 - GRPO on GSM8K from base Qwen2.5-1.5B-Instruct (Option A)"),
+        md("# 06 - GRPO on GSM8K from base Qwen2.5-1.5B-Instruct"),
         md("## 1. Installations"),
         INSTALL,
         md("## 2. Environment check"),
@@ -208,10 +208,9 @@ def build_06():
         writefile("rf_extract.py"),
         writefile("rf_eval.py"),
         md("## 4. Config"),
-        code(r'''
-SMOKE_TEST = True
+        code(r"""
+MODE = "smoke"
 
-RUN_NAME          = "grpo_a"
 MODEL_ID          = "unsloth/Qwen2.5-1.5B-Instruct"
 LOAD_4BIT         = False
 LORA_R, LORA_ALPHA = 32, 64
@@ -224,23 +223,23 @@ LR                = 1e-5
 BETA              = 0.0
 NUM_ITERATIONS    = 1
 EPSILON, EPSILON_HIGH = 0.2, 0.28
-FORMAT_WEIGHT     = 0.1
-MAX_STEPS         = 600
-SAVE_STEPS        = 25
-TIME_BUDGET_HOURS = 10.0
+EDGE_WEIGHT       = 0.25
 
-EVAL_SETS         = ["gsm8k", "math500"]
-EVAL_N            = None
+MAX_STEPS, SAVE_STEPS, EVAL_N, TIME_BUDGET_HOURS = {
+    "smoke": (5, 5, 50, 1.0),
+    "pilot": (100, 25, None, 3.0),
+    "full":  (600, 50, None, 9.0),
+}[MODE]
 
-if SMOKE_TEST:
-    MAX_STEPS, SAVE_STEPS, EVAL_N, TIME_BUDGET_HOURS = 5, 5, 50, 1.0
-
+RUN_NAME  = f"grpo_a_{MODE}"
 OUT_DIR   = f"/kaggle/working/{RUN_NAME}"
 FINAL_DIR = f"/kaggle/working/{RUN_NAME}-final"
-print(f"SMOKE_TEST={SMOKE_TEST}  MAX_STEPS={MAX_STEPS}  completions/step={NUM_GENERATIONS*PROMPTS_PER_STEP}")
-'''),
+RES_DIR   = "/kaggle/working/results"
+os.makedirs(RES_DIR, exist_ok=True)
+print(f"{MODE}: {MAX_STEPS} steps x {PROMPTS_PER_STEP} prompts x {NUM_GENERATIONS} samples")
+"""),
         md("## 5. Weights & Biases"),
-        code(r'''
+        code(r"""
 REPORT_TO = "none"
 try:
     from kaggle_secrets import UserSecretsClient
@@ -248,11 +247,11 @@ try:
     os.environ["WANDB_PROJECT"] = "reasonforge"
     REPORT_TO = "wandb"
 except Exception as e:
-    print("W&B disabled (no WANDB_API_KEY secret):", type(e).__name__)
+    print("W&B disabled:", type(e).__name__)
 print("report_to:", REPORT_TO)
-'''),
+"""),
         md("## 6. Load model"),
-        code(r'''
+        code(r"""
 from unsloth import FastLanguageModel
 import torch
 
@@ -273,19 +272,39 @@ model = FastLanguageModel.get_peft_model(
     random_state=3407,
 )
 print(f"allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-'''),
-        md("## 7. Data + rewards"),
-        code(r'''
-from datasets import load_dataset
-from rf_extract import user_prompt, gsm8k_gold, extract_boxed, answers_match, has_boxed
+"""),
+        md("## 7. Training set from the base samples"),
+        code(r"""
+import glob, pickle
+import numpy as np
+from datasets import Dataset
+from rf_extract import user_prompt, extract_boxed, answers_match
 
-train = load_dataset("openai/gsm8k", "main", split="train")
-train = train.map(lambda r: {"prompt": [{"role": "user", "content": user_prompt(r["question"], "boxed")}],
-                             "gold": gsm8k_gold(r["answer"])},
-                  remove_columns=train.column_names)
-print(train)
+SAMPLES = glob.glob("/kaggle/input/**/gsm8k_train_k8.pkl", recursive=True)[0]
+rows = pickle.load(open(SAMPLES, "rb"))["rows"]
+train_rows = [r for r in rows if r["split"] == "train"]
+dev_rows = [r for r in rows if r["split"] == "dev"]
+K = len(train_rows[0]["samples"])
+
+passes = np.array([sum(s["reward"] for s in r["samples"]) for r in train_rows])
+weights = np.where((passes == 0) | (passes == K), EDGE_WEIGHT, 1.0)
+n_prompts = MAX_STEPS * PROMPTS_PER_STEP
+rng = np.random.default_rng(42)
+idx = rng.choice(len(train_rows), size=n_prompts, replace=n_prompts > len(train_rows), p=weights / weights.sum())
+
+train = Dataset.from_list([{
+    "prompt": [{"role": "user", "content": user_prompt(train_rows[i]["question"], "boxed")}],
+    "gold": train_rows[i]["gold"],
+    "pass_rate": int(passes[i]),
+} for i in idx])
+
+print(f"samples file: {SAMPLES}")
+print(f"train problems {len(train_rows)}  dev {len(dev_rows)}  prompts for this run {len(train)}")
+print("pass-rate mix in this run:", np.bincount([int(passes[i]) for i in idx], minlength=K + 1).tolist())
 print(train[0]["prompt"][0]["content"], "\n-> gold:", train[0]["gold"])
-
+"""),
+        md("## 8. Reward"),
+        code(r"""
 _calls = {"n": 0}
 
 def correctness_reward(completions, gold, **kwargs):
@@ -294,26 +313,26 @@ def correctness_reward(completions, gold, **kwargs):
     _calls["n"] += 1
     if _calls["n"] % 25 == 1:
         print(f"\n--- sample (call {_calls['n']}) gold={gold[0]} pred={extract_boxed(texts[0])} r={rewards[0]}\n"
-              f"{texts[0][-600:]}\n---")
+              f"{texts[0][-500:]}\n---")
     return rewards
-
-def format_reward(completions, **kwargs):
-    return [FORMAT_WEIGHT if has_boxed(c[0]["content"]) else 0.0 for c in completions]
-'''),
-        md("## 8. Trainer"),
-        code(r'''
-import glob, json, re, time
+"""),
+        md("## 9. Trainer"),
+        code(r"""
+import json, re, time
 from transformers import TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from unsloth import is_bfloat16_supported
+
+def step_of(path):
+    return int(re.search(r"checkpoint-(\d+)", path).group(1))
 
 def latest_checkpoint():
     cands = glob.glob("/kaggle/input/**/checkpoint-*/trainer_state.json", recursive=True)
     cands += glob.glob(f"{OUT_DIR}/checkpoint-*/trainer_state.json")
     cands = [os.path.dirname(c) for c in cands if RUN_NAME in c]
-    return max(cands, key=lambda p: int(re.search(r"checkpoint-(\d+)", p).group(1)), default=None)
+    return max(cands, key=step_of, default=None)
 
-RESUME = None if SMOKE_TEST else latest_checkpoint()
+RESUME = None if MODE == "smoke" else latest_checkpoint()
 print("resume from:", RESUME)
 
 class TimeBudgetAndLogs(TrainerCallback):
@@ -362,68 +381,71 @@ args = GRPOConfig(
     epsilon_high=EPSILON_HIGH,
     max_steps=MAX_STEPS,
     save_steps=SAVE_STEPS,
-    save_total_limit=2,
+    save_total_limit=None,
     logging_steps=1,
 )
 
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
-    reward_funcs=[correctness_reward, format_reward],
+    reward_funcs=[correctness_reward],
     args=args,
     train_dataset=train,
     callbacks=[TimeBudgetAndLogs(TIME_BUDGET_HOURS)],
 )
-'''),
-        md("## 9. Train"),
-        code(r'''
+"""),
+        md("## 10. Train"),
+        code(r"""
 t0 = time.time()
 trainer.train(resume_from_checkpoint=RESUME)
 print(f"training wall time: {(time.time()-t0)/3600:.2f} h")
-'''),
-        md("## 10. Save adapter + logs"),
-        code(r'''
-import shutil
+
 model.save_lora(FINAL_DIR)
 tokenizer.save_pretrained(FINAL_DIR)
 with open(f"{FINAL_DIR}/log_history.json", "w") as f:
     json.dump(trainer.state.log_history, f)
-
-shutil.make_archive(f"/kaggle/working/{RUN_NAME}_adapter", "zip", FINAL_DIR)
-os.makedirs("/kaggle/working/logs", exist_ok=True)
-shutil.copy(f"{FINAL_DIR}/log_history.json", f"/kaggle/working/logs/{RUN_NAME}_log_history.json")
-shutil.make_archive(f"/kaggle/working/{RUN_NAME}_logs", "zip", "/kaggle/working/logs")
-print(os.listdir(FINAL_DIR))
-'''),
-        md("## 11. Eval: base vs GRPO"),
-        code(r'''
+"""),
+        md("## 11. Training curve"),
+        code(r"""
+keys = ["reward", "reward_std", "frac_reward_zero_std", "completions/mean_length",
+        "completions/clipped_ratio", "loss", "grad_norm", "kl"]
+hist = [h for h in trainer.state.log_history if "reward" in h]
+every = max(1, len(hist) // 20)
+print(f"{'step':>5s} " + " ".join(f"{k.split('/')[-1][:12]:>12s}" for k in keys))
+for h in hist[::every] + ([hist[-1]] if hist[-1] not in hist[::every] else []):
+    print(f"{h['step']:5d} " + " ".join(f"{h[k]:12.3f}" if k in h else f"{'-':>12s}" for k in keys))
+"""),
+        md("## 12. Dev accuracy per checkpoint"),
+        code(r"""
+import shutil
 from vllm import SamplingParams
-from rf_eval import load_eval_set, chat_prompts, rows_from_outputs, quick_acc, load_result, save_result
+from rf_eval import chat_prompts, graded, save_result
 
-RES_DIR = "/kaggle/working/results"
-os.makedirs(RES_DIR, exist_ok=True)
 sp = SamplingParams(temperature=0.0, max_tokens=MAX_COMPLETION, repetition_penalty=1.0)
-lora = model.load_lora(FINAL_DIR)
+dev_items = dev_rows[:EVAL_N] if EVAL_N else dev_rows
+prompts = chat_prompts(tokenizer, dev_items, "boxed")
 
-for ds_name in EVAL_SETS:
-    items = load_eval_set(ds_name, EVAL_N)
-    prompts = chat_prompts(tokenizer, items, "boxed")
-    path = f"{RES_DIR}/{ds_name}_boxed_{RUN_NAME}.pkl"
-    result = load_result(path, {"dataset": ds_name, "style": "boxed", "n": len(items),
-                                "max_new": MAX_COMPLETION, "engine": "unsloth-vllm", "decoding": "greedy"})
-    for name, lr in [("base", None), (RUN_NAME, lora)]:
-        t1 = time.time()
-        outs = model.fast_generate(prompts, sampling_params=sp, lora_request=lr)
-        result[name] = rows_from_outputs(items, outs)
-        save_result(path, result)
-        rows = result[name]
-        print(f"{ds_name:8s} {name:8s} acc {quick_acc(rows)*100:5.1f}%  "
-              f"trunc {sum(r['truncated'] for r in rows)/len(rows)*100:4.1f}%  "
-              f"boxed {sum(r['has_box'] for r in rows)/len(rows)*100:5.1f}%  ({(time.time()-t1)/60:.1f} min)")
+ckpts = sorted(glob.glob(f"{OUT_DIR}/checkpoint-*"), key=step_of)
+runs = [("base", None)] + [(f"step{step_of(c)}", c) for c in ckpts] + [("final", FINAL_DIR)]
 
+dev = {"config": {"n": len(dev_items), "max_new": MAX_COMPLETION, "mode": MODE}}
+print(f"{'model':>10s} {'dev acc':>8s} {'trunc':>6s} {'tokens':>7s}")
+for name, path in runs:
+    lora = model.load_lora(path) if path else None
+    outs = model.fast_generate(prompts, sampling_params=sp, lora_request=lora)
+    dev[name] = [{**it, **graded(o.outputs[0], it["gold"])} for it, o in zip(dev_items, outs)]
+    acc = sum(r["reward"] for r in dev[name]) / len(dev[name])
+    trunc = sum(r["truncated"] for r in dev[name]) / len(dev[name])
+    toks = sorted(r["n_new_tokens"] for r in dev[name])[len(dev[name]) // 2]
+    print(f"{name:>10s} {acc*100:7.1f}% {trunc*100:5.1f}% {toks:7d}")
+    save_result(f"{RES_DIR}/dev_{RUN_NAME}.pkl", dev)
+"""),
+        md("## 13. Package for download"),
+        code(r"""
+shutil.make_archive(f"/kaggle/working/{RUN_NAME}_adapter", "zip", FINAL_DIR)
 shutil.make_archive("/kaggle/working/results", "zip", "/kaggle/working", "results")
-print("\ndownload: results.zip, grpo_a_adapter.zip, grpo_a_logs.zip")
-'''),
+print(f"download: {RUN_NAME}_adapter.zip, results.zip")
+"""),
     ]
     save("06-grpo-base.ipynb", cells)
 
@@ -531,7 +553,229 @@ print("download /kaggle/working/samples.zip from the Output panel")
     save("07-sample-base.ipynb", cells)
 
 
+def build_08():
+    cells = [
+        md("# 08 - DPO on the base model's own samples"),
+        md("## 1. Installations"),
+        INSTALL,
+        md("## 2. Environment check"),
+        ENV,
+        md("## 3. Shared extractor + eval helpers"),
+        writefile("rf_extract.py"),
+        writefile("rf_eval.py"),
+        md("## 4. Config"),
+        code(r"""
+MODE = "smoke"
+
+MODEL_ID          = "unsloth/Qwen2.5-1.5B-Instruct"
+LORA_R, LORA_ALPHA = 32, 64
+
+BETA              = 0.1
+LR                = 5e-6
+BATCH             = 2
+GRAD_ACCUM        = 8
+MAX_PROMPT_LEN    = 320
+MAX_LEN           = 1536
+EVAL_MAX_NEW      = 1024
+
+N_PAIRS, SAVE_STEPS, EVAL_N, TIME_BUDGET_HOURS = {
+    "smoke": (80, 5, 50, 1.0),
+    "pilot": (1600, 25, None, 3.0),
+    "full":  (None, 50, None, 9.0),
+}[MODE]
+
+RUN_NAME  = f"dpo_{MODE}"
+OUT_DIR   = f"/kaggle/working/{RUN_NAME}"
+FINAL_DIR = f"/kaggle/working/{RUN_NAME}-final"
+RES_DIR   = "/kaggle/working/results"
+os.makedirs(RES_DIR, exist_ok=True)
+print(f"{MODE}: pairs={N_PAIRS or 'all'}  pairs/step={BATCH*GRAD_ACCUM}")
+"""),
+        md("## 5. Load model"),
+        code(r"""
+from unsloth import FastLanguageModel
+import torch
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_ID,
+    max_seq_length=MAX_LEN,
+    load_in_4bit=False,
+    fast_inference=True,
+    max_lora_rank=LORA_R,
+    gpu_memory_utilization=0.7,
+)
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    use_gradient_checkpointing="unsloth",
+    random_state=3407,
+)
+print(f"allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+"""),
+        md("## 6. Preference pairs from the base samples"),
+        code(r"""
+import glob, pickle, random
+from datasets import Dataset
+from rf_extract import user_prompt
+
+SAMPLES = glob.glob("/kaggle/input/**/gsm8k_train_k8.pkl", recursive=True)[0]
+rows = pickle.load(open(SAMPLES, "rb"))["rows"]
+train_rows = [r for r in rows if r["split"] == "train"]
+dev_rows = [r for r in rows if r["split"] == "dev"]
+
+rng = random.Random(42)
+pairs = []
+for r in train_rows:
+    right = [s for s in r["samples"] if s["reward"] and not s["truncated"]]
+    wrong = [s for s in r["samples"] if not s["reward"]]
+    if right and wrong:
+        pairs.append({
+            "prompt": [{"role": "user", "content": user_prompt(r["question"], "boxed")}],
+            "chosen": [{"role": "assistant", "content": rng.choice(right)["resp"]}],
+            "rejected": [{"role": "assistant", "content": rng.choice(wrong)["resp"]}],
+        })
+rng.shuffle(pairs)
+if N_PAIRS:
+    pairs = pairs[:N_PAIRS]
+train = Dataset.from_list(pairs)
+
+lens = sorted(len(tokenizer(p["chosen"][0]["content"]).input_ids) for p in pairs[:500])
+print(f"samples file: {SAMPLES}")
+print(f"pairs {len(train)} from {len(train_rows)} train problems; chosen median {lens[len(lens)//2]} tokens, p95 {lens[int(len(lens)*0.95)]}")
+print(train[0]["prompt"][0]["content"][:200], "...")
+"""),
+        md("## 7. Trainer"),
+        code(r"""
+import json, re, time
+from transformers import TrainerCallback
+from trl import DPOConfig, DPOTrainer
+from unsloth import is_bfloat16_supported
+
+def step_of(path):
+    return int(re.search(r"checkpoint-(\d+)", path).group(1))
+
+def latest_checkpoint():
+    cands = glob.glob("/kaggle/input/**/checkpoint-*/trainer_state.json", recursive=True)
+    cands += glob.glob(f"{OUT_DIR}/checkpoint-*/trainer_state.json")
+    cands = [os.path.dirname(c) for c in cands if RUN_NAME in c]
+    return max(cands, key=step_of, default=None)
+
+RESUME = None if MODE == "smoke" else latest_checkpoint()
+print("resume from:", RESUME)
+
+class TimeBudgetAndLogs(TrainerCallback):
+    def __init__(self, hours):
+        self.deadline = time.time() + hours * 3600
+        self.t_last = None
+    def on_step_end(self, args, state, control, **kw):
+        now = time.time()
+        if self.t_last is not None and state.global_step % 5 == 0:
+            print(f"step {state.global_step}: {now - self.t_last:.0f}s/step")
+        self.t_last = now
+        if now > self.deadline:
+            print(f"time budget reached at step {state.global_step} -> saving and stopping")
+            control.should_save = True
+            control.should_training_stop = True
+    def on_save(self, args, state, control, **kw):
+        with open(f"{args.output_dir}/log_history.json", "w") as f:
+            json.dump(state.log_history, f)
+
+args = DPOConfig(
+    output_dir=OUT_DIR,
+    run_name=RUN_NAME,
+    report_to="none",
+    seed=42,
+    beta=BETA,
+    loss_type="sigmoid",
+    learning_rate=LR,
+    lr_scheduler_type="constant_with_warmup",
+    warmup_steps=10,
+    optim="adamw_8bit",
+    weight_decay=0.0,
+    max_grad_norm=1.0,
+    fp16=not is_bfloat16_supported(),
+    bf16=is_bfloat16_supported(),
+    per_device_train_batch_size=BATCH,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    num_train_epochs=1,
+    max_length=MAX_LEN,
+    max_prompt_length=MAX_PROMPT_LEN,
+    precompute_ref_log_probs=True,
+    save_steps=SAVE_STEPS,
+    save_total_limit=None,
+    logging_steps=1,
+    remove_unused_columns=False,
+)
+
+trainer = DPOTrainer(
+    model=model,
+    ref_model=None,
+    args=args,
+    train_dataset=train,
+    processing_class=tokenizer,
+    callbacks=[TimeBudgetAndLogs(TIME_BUDGET_HOURS)],
+)
+print("steps:", trainer.state.max_steps or len(train) // (BATCH * GRAD_ACCUM))
+"""),
+        md("## 8. Train"),
+        code(r"""
+t0 = time.time()
+trainer.train(resume_from_checkpoint=RESUME)
+print(f"training wall time: {(time.time()-t0)/3600:.2f} h")
+
+model.save_lora(FINAL_DIR)
+tokenizer.save_pretrained(FINAL_DIR)
+with open(f"{FINAL_DIR}/log_history.json", "w") as f:
+    json.dump(trainer.state.log_history, f)
+"""),
+        md("## 9. Training curve"),
+        code(r"""
+keys = ["rewards/accuracies", "rewards/margins", "rewards/chosen", "rewards/rejected", "loss", "grad_norm"]
+hist = [h for h in trainer.state.log_history if "rewards/margins" in h]
+every = max(1, len(hist) // 20)
+print(f"{'step':>5s} " + " ".join(f"{k.split('/')[-1][:10]:>10s}" for k in keys))
+for h in hist[::every] + ([hist[-1]] if hist[-1] not in hist[::every] else []):
+    print(f"{h['step']:5d} " + " ".join(f"{h[k]:10.3f}" if k in h else f"{'-':>10s}" for k in keys))
+"""),
+        md("## 10. Dev accuracy per checkpoint"),
+        code(r"""
+import shutil
+from vllm import SamplingParams
+from rf_eval import chat_prompts, graded, save_result
+
+sp = SamplingParams(temperature=0.0, max_tokens=EVAL_MAX_NEW, repetition_penalty=1.0)
+dev_items = dev_rows[:EVAL_N] if EVAL_N else dev_rows
+prompts = chat_prompts(tokenizer, dev_items, "boxed")
+
+ckpts = sorted(glob.glob(f"{OUT_DIR}/checkpoint-*"), key=step_of)
+runs = [("base", None)] + [(f"step{step_of(c)}", c) for c in ckpts] + [("final", FINAL_DIR)]
+
+dev = {"config": {"n": len(dev_items), "max_new": EVAL_MAX_NEW, "mode": MODE}}
+print(f"{'model':>10s} {'dev acc':>8s} {'trunc':>6s} {'tokens':>7s}")
+for name, path in runs:
+    lora = model.load_lora(path) if path else None
+    outs = model.fast_generate(prompts, sampling_params=sp, lora_request=lora)
+    dev[name] = [{**it, **graded(o.outputs[0], it["gold"])} for it, o in zip(dev_items, outs)]
+    acc = sum(r["reward"] for r in dev[name]) / len(dev[name])
+    trunc = sum(r["truncated"] for r in dev[name]) / len(dev[name])
+    toks = sorted(r["n_new_tokens"] for r in dev[name])[len(dev[name]) // 2]
+    print(f"{name:>10s} {acc*100:7.1f}% {trunc*100:5.1f}% {toks:7d}")
+    save_result(f"{RES_DIR}/dev_{RUN_NAME}.pkl", dev)
+"""),
+        md("## 11. Package for download"),
+        code(r"""
+shutil.make_archive(f"/kaggle/working/{RUN_NAME}_adapter", "zip", FINAL_DIR)
+shutil.make_archive("/kaggle/working/results", "zip", "/kaggle/working", "results")
+print(f"download: {RUN_NAME}_adapter.zip, results.zip")
+"""),
+    ]
+    save("08-dpo-base.ipynb", cells)
+
+
 if __name__ == "__main__":
     build_05()
     build_06()
     build_07()
+    build_08()

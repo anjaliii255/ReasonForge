@@ -69,6 +69,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_NO_TF"] = "1"; os.environ["USE_TF"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
 
@@ -572,8 +573,8 @@ LORA_R, LORA_ALPHA = 32, 64
 
 BETA              = 0.1
 LR                = 5e-6
-BATCH             = 2
-GRAD_ACCUM        = 8
+BATCH             = 1
+GRAD_ACCUM        = 16
 MAX_PROMPT_LEN    = 320
 MAX_LEN           = 1536
 EVAL_MAX_NEW      = 1024
@@ -600,9 +601,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_ID,
     max_seq_length=MAX_LEN,
     load_in_4bit=False,
-    fast_inference=True,
-    max_lora_rank=LORA_R,
-    gpu_memory_utilization=0.7,
+    fast_inference=False,
 )
 model = FastLanguageModel.get_peft_model(
     model,
@@ -703,6 +702,7 @@ args = DPOConfig(
     max_length=MAX_LEN,
     max_prompt_length=MAX_PROMPT_LEN,
     precompute_ref_log_probs=True,
+    use_logits_to_keep=True,
     save_steps=SAVE_STEPS,
     save_total_limit=None,
     logging_steps=1,
@@ -725,15 +725,16 @@ t0 = time.time()
 trainer.train(resume_from_checkpoint=RESUME)
 print(f"training wall time: {(time.time()-t0)/3600:.2f} h")
 
-model.save_lora(FINAL_DIR)
+model.save_pretrained(FINAL_DIR)
 tokenizer.save_pretrained(FINAL_DIR)
 with open(f"{FINAL_DIR}/log_history.json", "w") as f:
     json.dump(trainer.state.log_history, f)
+log_history = trainer.state.log_history
 """),
         md("## 9. Training curve"),
         code(r"""
 keys = ["rewards/accuracies", "rewards/margins", "rewards/chosen", "rewards/rejected", "loss", "grad_norm"]
-hist = [h for h in trainer.state.log_history if "rewards/margins" in h]
+hist = [h for h in log_history if "rewards/margins" in h]
 every = max(1, len(hist) // 20)
 print(f"{'step':>5s} " + " ".join(f"{k.split('/')[-1][:10]:>10s}" for k in keys))
 for h in hist[::every] + ([hist[-1]] if hist[-1] not in hist[::every] else []):
@@ -741,10 +742,27 @@ for h in hist[::every] + ([hist[-1]] if hist[-1] not in hist[::every] else []):
 """),
         md("## 10. Dev accuracy per checkpoint"),
         code(r"""
-import shutil
-from vllm import SamplingParams
+import gc, shutil
 from rf_eval import chat_prompts, graded, save_result
 
+del trainer, model
+gc.collect()
+torch.cuda.empty_cache()
+print(f"allocated after cleanup: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(
+    model=MODEL_ID,
+    dtype="half",
+    max_model_len=EVAL_MAX_NEW + 512,
+    gpu_memory_utilization=0.6,
+    enable_lora=True,
+    max_lora_rank=LORA_R,
+    max_loras=1,
+    seed=0,
+)
 sp = SamplingParams(temperature=0.0, max_tokens=EVAL_MAX_NEW, repetition_penalty=1.0)
 dev_items = dev_rows[:EVAL_N] if EVAL_N else dev_rows
 prompts = chat_prompts(tokenizer, dev_items, "boxed")
@@ -754,9 +772,9 @@ runs = [("base", None)] + [(f"step{step_of(c)}", c) for c in ckpts] + [("final",
 
 dev = {"config": {"n": len(dev_items), "max_new": EVAL_MAX_NEW, "mode": MODE}}
 print(f"{'model':>10s} {'dev acc':>8s} {'trunc':>6s} {'tokens':>7s}")
-for name, path in runs:
-    lora = model.load_lora(path) if path else None
-    outs = model.fast_generate(prompts, sampling_params=sp, lora_request=lora)
+for i, (name, path) in enumerate(runs):
+    lora = LoRARequest(name, i + 1, path) if path else None
+    outs = llm.generate(prompts, sp, lora_request=lora)
     dev[name] = [{**it, **graded(o.outputs[0], it["gold"])} for it, o in zip(dev_items, outs)]
     acc = sum(r["reward"] for r in dev[name]) / len(dev[name])
     trunc = sum(r["truncated"] for r in dev[name]) / len(dev[name])

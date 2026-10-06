@@ -76,4 +76,23 @@ Same harness as base and SFT.
 - MATH-500 moved a little from GSM8K-only training. Gains on Intermediate Algebra, Prealgebra and Precalculus, a drop on Geometry; by level, gains on 1 to 3 and 5, a drop on 4. The slices are small, so no conclusions from any single one.
 - The same adapter got evaluated twice under two labels by accident. The two runs differ by 0.2 to 0.4 points. Useful as a noise gauge.
 
-Next: DPO on the right/wrong pairs from the sampling run, to compare off-policy training with GRPO on the same data.
+## 5 Oct 2026: DPO on the base model's own samples
+
+- Data: for each training problem with both right and wrong samples, one random correct answer as chosen and one random wrong answer as rejected. 4,930 pairs, dev problems excluded.
+- Setup: LoRA rank 32 on fp16, beta 0.1, learning rate 5e-6, 16 pairs per step, one epoch. The first attempt ran out of memory because vLLM was loaded alongside the training model; DPO keeps full logits for four sequences per step, which GRPO avoids. Fixed by training without vLLM and loading a fresh engine afterwards for the dev evaluation.
+- 309 steps at about 11 seconds each, 2.4 hours, plus 1.4 hours to precompute reference log-probs. Reward margin grew from 0.35 to about 2.2.
+- Dev accuracy 85.4 to 88.6 (p = 0.024). On dev, DPO and GRPO are indistinguishable: 414 problems both right, 29 only DPO, 30 only GRPO. Both gain on problems base solved 1 to 5 times out of 8. DPO did not shorten answers; GRPO did.
+
+## 6 Oct 2026: DPO on the test sets
+
+| | GSM8K boxed | GSM8K plain | MATH-500 boxed | MATH-500 plain |
+|---|---|---|---|---|
+| Base | 75.7 | 71.8 | 56.4 | 53.0 |
+| GRPO | 76.9 | 77.2 | 58.0 | 56.0 |
+| DPO | 76.4 | 74.6 | 54.4 | 54.4 |
+
+- DPO's only significant gain is GSM8K plain (+2.8, p = 0.005). On MATH-500 it is flat to slightly worse, within noise.
+- GRPO beats DPO on GSM8K plain (p = 0.03) and is ahead, though not significantly, everywhere else.
+- The same dev gain (+3.2 vs +3.4) turned into different test gains. DPO trained on samples drawn once from the base model; GRPO drew fresh samples from the current model at every step. The fresh samples generalised better.
+
+Core experiments done. Open options: SFT redo with the fixed training code, distillation to 0.5B.

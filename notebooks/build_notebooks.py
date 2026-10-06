@@ -636,8 +636,8 @@ for r in train_rows:
             "rejected": [{"role": "assistant", "content": rng.choice(wrong)["resp"]}],
         })
 rng.shuffle(pairs)
-if N_PAIRS:
-    pairs = pairs[:N_PAIRS]
+step = BATCH * GRAD_ACCUM
+pairs = pairs[:N_PAIRS or len(pairs) // step * step]
 train = Dataset.from_list(pairs)
 
 lens = sorted(len(tokenizer(p["chosen"][0]["content"]).input_ids) for p in pairs[:500])

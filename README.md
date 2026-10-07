@@ -23,7 +23,7 @@ Evaluating the same adapter twice gives numbers 0.2 to 0.4 points apart, so diff
 
 What this says:
 
-- SFT on 10K R1 traces made the model worse. It copied R1's habit of re-checking itself but could not resolve the doubt, so a quarter of its GSM8K answers and half of its MATH-500 answers loop until the token limit.
+- SFT on 10K R1 traces made the model worse. It copied R1's habit of re-checking itself but could not resolve the doubt, so a quarter of its GSM8K answers and half of its MATH-500 answers loop until the token limit. Rerunning with the training bugs fixed gave the same loops (dev 85.4 to 54.2), so the data is the problem, not the code. The fixed code on the model's own correct answers was flat (84.4 to 85.0).
 - GRPO never hurts. Its main effect is robustness: base drops 4 points when the prompt does not ask for a boxed answer, GRPO does not. Answers also get 23% shorter.
 - DPO on stored right/wrong pairs matched GRPO on the dev set (88.6 vs 88.8) but not on the test set. Learning from fresh samples generalised better than learning from stored ones.
 - The base model already solves 96% of GSM8K training problems in at least one of 8 samples. What is left to gain is mostly consistency, and that is where both GRPO and DPO got their improvement.
@@ -37,10 +37,11 @@ Model: Qwen2.5-1.5B-Instruct. Compute: one Kaggle T4 (16 GB), sessions capped at
 3. **Sampling** (`07-sample-base`): base sampled 8 times per GSM8K training problem. Greedy 85.1%, majority of 8 89.1%, at least one of 8 correct 96.2%. The pass rates drive GRPO's prompt selection; the samples are DPO's training pairs.
 4. **GRPO** (`06-grpo-base`): Unsloth + TRL, LoRA rank 32 on fp16, 8 samples per prompt, 600 steps, 6 hours. Reward is 1 if the boxed answer matches, else 0. Prompts with mixed pass rates get full weight, the rest a quarter. Dev accuracy 85.4 to 88.8.
 5. **DPO** (`08-dpo-base`): one correct and one wrong sample per problem, 4,930 pairs, one epoch, beta 0.1, 2.4 hours plus 1.4 hours of reference log-prob precomputation. Dev accuracy 85.4 to 88.6.
+6. **SFT redo** (`09-sft-redo`): the SFT bugs fixed (own pad token, loss on the answer only, fp16 LoRA), run twice. On the model's own correct answers: 6,711 examples, 37 minutes, dev flat at 84.4 to 85.0. On 6,000 R1 traces: 3.2 hours, dev 54.2 with the same loops as before. Neither was taken to the test set.
 
 A 500-problem dev split of GSM8K train is used for every checkpoint decision; the test sets are only reported, never selected on. Dev scores run about 10 points above test because the model has seen the training problems, which is why dev gains shrink on test.
 
-The scoring code is in `analysis/`. `rf_extract.py` is the one answer checker shared by the GRPO reward, the Kaggle evaluation and the local scorer. `score.py` gives accuracy, confidence intervals, paired tests, a failure breakdown and MATH-500 results by subject and level. `notebooks/build_notebooks.py` generates notebooks 05 to 08 from the files in `analysis/`.
+The scoring code is in `analysis/`. `rf_extract.py` is the one answer checker shared by the GRPO reward, the Kaggle evaluation and the local scorer. `score.py` gives accuracy, confidence intervals, paired tests, a failure breakdown and MATH-500 results by subject and level. `notebooks/build_notebooks.py` generates notebooks 05 to 09 from the files in `analysis/`.
 
 ## Reproduce
 
@@ -54,8 +55,9 @@ Run on Kaggle with a T4 and internet on, as a committed version so the outputs a
 
 ## Status
 
-Done: SFT, evaluation harness, base sampling, GRPO, DPO.
-Possible next steps: SFT redo with the training bugs fixed, distillation to 0.5B.
+Done: SFT, evaluation harness, base sampling, GRPO, DPO, SFT redo.
+
+Possible later: distillation to 0.5B.
 
 ## License
 

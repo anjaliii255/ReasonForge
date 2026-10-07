@@ -792,8 +792,251 @@ print(f"download: {RUN_NAME}_adapter.zip, results.zip")
     save("08-dpo-base.ipynb", cells)
 
 
+def build_09():
+    cells = [
+        md("# 09 - SFT redo with the training bugs fixed"),
+        md("## 1. Installations"),
+        INSTALL,
+        md("## 2. Environment check"),
+        ENV,
+        md("## 3. Shared extractor + eval helpers"),
+        writefile("rf_extract.py"),
+        writefile("rf_eval.py"),
+        md("## 4. Config"),
+        code(r"""
+MODE = "smoke"
+DATA = "self"
+
+MODEL_ID          = "unsloth/Qwen2.5-1.5B-Instruct"
+LORA_R, LORA_ALPHA = 32, 64
+LR                = 2e-4
+BATCH             = 1
+GRAD_ACCUM        = 16
+MAX_LEN           = {"self": 1536, "r1": 4096}[DATA]
+EVAL_MAX_NEW      = 2048
+
+N_EXAMPLES, SAVE_STEPS, EVAL_N, TIME_BUDGET_HOURS = {
+    "smoke": (80, 5, 50, 1.0),
+    "full":  ({"self": None, "r1": 10000}[DATA], 100, None, 9.0),
+}[MODE]
+
+RUN_NAME  = f"sft2_{DATA}_{MODE}"
+OUT_DIR   = f"/kaggle/working/{RUN_NAME}"
+FINAL_DIR = f"/kaggle/working/{RUN_NAME}-final"
+RES_DIR   = "/kaggle/working/results"
+os.makedirs(RES_DIR, exist_ok=True)
+print(f"{MODE} on {DATA}: examples={N_EXAMPLES or 'all'}  examples/step={BATCH*GRAD_ACCUM}  max_len={MAX_LEN}")
+"""),
+        md("## 5. Load model"),
+        code(r"""
+from unsloth import FastLanguageModel
+import torch
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_ID,
+    max_seq_length=MAX_LEN,
+    load_in_4bit=False,
+    fast_inference=False,
+)
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    use_gradient_checkpointing="unsloth",
+    random_state=3407,
+)
+print("eos:", tokenizer.eos_token, "| pad:", tokenizer.pad_token)
+print(f"allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+"""),
+        md("## 6. Training data"),
+        code(r"""
+import glob, pickle, random
+from datasets import Dataset, load_from_disk
+from rf_extract import user_prompt
+
+rng = random.Random(42)
+samples_path = glob.glob("/kaggle/input/**/gsm8k_train_k8.pkl", recursive=True)[0]
+rows = pickle.load(open(samples_path, "rb"))["rows"]
+dev_rows = [r for r in rows if r["split"] == "dev"]
+
+if DATA == "self":
+    examples = []
+    for r in rows:
+        if r["split"] != "train":
+            continue
+        right = [s for s in r["samples"] if s["reward"] and not s["truncated"]]
+        if right:
+            prompt = tokenizer.apply_chat_template([{"role": "user", "content": user_prompt(r["question"], "boxed")}],
+                                                   tokenize=False, add_generation_prompt=True)
+            examples.append({"prompt": prompt, "completion": rng.choice(right)["resp"]})
+else:
+    r1_dir = os.path.dirname(glob.glob("/kaggle/input/**/train_ds/dataset_info.json", recursive=True)[0])
+    marker = "<|im_start|>assistant\n"
+    examples = []
+    for text in load_from_disk(r1_dir)["text"]:
+        head, tail = text.split(marker, 1)
+        examples.append({"prompt": head + marker, "completion": tail.rstrip()})
+
+rng.shuffle(examples)
+examples = examples[:N_EXAMPLES] if N_EXAMPLES else examples
+train = Dataset.from_list(examples)
+
+lens = sorted(len(tokenizer(e["completion"]).input_ids) for e in examples[:500])
+print(f"{DATA}: {len(train)} examples; completion median {lens[len(lens)//2]} tokens, p95 {lens[int(len(lens)*0.95)]}")
+print(train[0]["prompt"][-120:], "...")
+print(train[0]["completion"][:200], "...")
+"""),
+        md("## 7. Trainer"),
+        code(r"""
+import json, re, time
+from transformers import TrainerCallback
+from trl import SFTConfig, SFTTrainer
+from unsloth import is_bfloat16_supported
+
+def step_of(path):
+    return int(re.search(r"checkpoint-(\d+)", path).group(1))
+
+def latest_checkpoint():
+    cands = glob.glob("/kaggle/input/**/checkpoint-*/trainer_state.json", recursive=True)
+    cands += glob.glob(f"{OUT_DIR}/checkpoint-*/trainer_state.json")
+    cands = [os.path.dirname(c) for c in cands if RUN_NAME in c]
+    return max(cands, key=step_of, default=None)
+
+RESUME = None if MODE == "smoke" else latest_checkpoint()
+print("resume from:", RESUME)
+
+class TimeBudgetAndLogs(TrainerCallback):
+    def __init__(self, hours):
+        self.deadline = time.time() + hours * 3600
+        self.t_last = None
+    def on_step_end(self, args, state, control, **kw):
+        now = time.time()
+        if self.t_last is not None and state.global_step % 10 == 0:
+            print(f"step {state.global_step}: {now - self.t_last:.0f}s/step")
+        self.t_last = now
+        if now > self.deadline:
+            print(f"time budget reached at step {state.global_step} -> saving and stopping")
+            control.should_save = True
+            control.should_training_stop = True
+    def on_save(self, args, state, control, **kw):
+        with open(f"{args.output_dir}/log_history.json", "w") as f:
+            json.dump(state.log_history, f)
+
+args = SFTConfig(
+    output_dir=OUT_DIR,
+    run_name=RUN_NAME,
+    report_to="none",
+    seed=42,
+    learning_rate=LR,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    optim="adamw_8bit",
+    weight_decay=0.0,
+    max_grad_norm=1.0,
+    fp16=not is_bfloat16_supported(),
+    bf16=is_bfloat16_supported(),
+    per_device_train_batch_size=BATCH,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    num_train_epochs=1,
+    max_length=MAX_LEN,
+    completion_only_loss=True,
+    packing=False,
+    save_steps=SAVE_STEPS,
+    save_total_limit=None,
+    logging_steps=1,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=args,
+    train_dataset=train,
+    processing_class=tokenizer,
+    callbacks=[TimeBudgetAndLogs(TIME_BUDGET_HOURS)],
+)
+
+batch = next(iter(trainer.get_train_dataloader()))
+labels = batch["labels"][0]
+print("tokens in loss:", int((labels != -100).sum()), "of", labels.numel())
+print("last label token:", tokenizer.decode([int(labels[labels != -100][-1])]))
+"""),
+        md("## 8. Train"),
+        code(r"""
+t0 = time.time()
+trainer.train(resume_from_checkpoint=RESUME)
+print(f"training wall time: {(time.time()-t0)/3600:.2f} h")
+
+model.save_pretrained(FINAL_DIR)
+tokenizer.save_pretrained(FINAL_DIR)
+with open(f"{FINAL_DIR}/log_history.json", "w") as f:
+    json.dump(trainer.state.log_history, f)
+log_history = trainer.state.log_history
+"""),
+        md("## 9. Training curve"),
+        code(r"""
+hist = [h for h in log_history if "loss" in h]
+every = max(1, len(hist) // 20)
+print(f"{'step':>5s} {'loss':>8s} {'grad_norm':>10s} {'lr':>10s}")
+for h in hist[::every] + ([hist[-1]] if hist[-1] not in hist[::every] else []):
+    print(f"{h['step']:5d} {h['loss']:8.3f} {h.get('grad_norm', float('nan')):10.3f} {h.get('learning_rate', 0):10.2e}")
+"""),
+        md("## 10. Dev accuracy per checkpoint"),
+        code(r"""
+import gc, shutil
+from rf_eval import chat_prompts, graded, save_result
+
+del trainer, model
+gc.collect()
+torch.cuda.empty_cache()
+print(f"allocated after cleanup: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(
+    model=MODEL_ID,
+    dtype="half",
+    max_model_len=EVAL_MAX_NEW + 512,
+    gpu_memory_utilization=0.6,
+    enable_lora=True,
+    max_lora_rank=LORA_R,
+    max_loras=1,
+    seed=0,
+)
+sp = SamplingParams(temperature=0.0, max_tokens=EVAL_MAX_NEW, repetition_penalty=1.0)
+dev_items = dev_rows[:EVAL_N] if EVAL_N else dev_rows
+prompts = chat_prompts(tokenizer, dev_items, "boxed")
+
+ckpts = sorted(glob.glob(f"{OUT_DIR}/checkpoint-*"), key=step_of)
+runs = [("base", None)] + [(f"step{step_of(c)}", c) for c in ckpts] + [("final", FINAL_DIR)]
+
+dev = {"config": {"n": len(dev_items), "max_new": EVAL_MAX_NEW, "mode": MODE, "data": DATA}}
+print(f"{'model':>10s} {'dev acc':>8s} {'trunc':>6s} {'loop':>6s} {'tokens':>7s}")
+for i, (name, path) in enumerate(runs):
+    lora = LoRARequest(name, i + 1, path) if path else None
+    outs = llm.generate(prompts, sp, lora_request=lora)
+    dev[name] = [{**it, **graded(o.outputs[0], it["gold"])} for it, o in zip(dev_items, outs)]
+    rows_ = dev[name]
+    acc = sum(r["reward"] for r in rows_) / len(rows_)
+    trunc = sum(r["truncated"] for r in rows_) / len(rows_)
+    loop = sum(r["looping"] for r in rows_) / len(rows_)
+    toks = sorted(r["n_new_tokens"] for r in rows_)[len(rows_) // 2]
+    print(f"{name:>10s} {acc*100:7.1f}% {trunc*100:5.1f}% {loop*100:5.1f}% {toks:7d}")
+    save_result(f"{RES_DIR}/dev_{RUN_NAME}.pkl", dev)
+"""),
+        md("## 11. Package for download"),
+        code(r"""
+shutil.make_archive(f"/kaggle/working/{RUN_NAME}_adapter", "zip", FINAL_DIR)
+shutil.make_archive("/kaggle/working/results", "zip", "/kaggle/working", "results")
+print(f"download: {RUN_NAME}_adapter.zip, results.zip")
+"""),
+    ]
+    save("09-sft-redo.ipynb", cells)
+
+
 if __name__ == "__main__":
     build_05()
     build_06()
     build_07()
     build_08()
+    build_09()

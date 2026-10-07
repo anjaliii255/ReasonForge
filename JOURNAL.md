@@ -95,4 +95,20 @@ Same harness as base and SFT.
 - GRPO beats DPO on GSM8K plain (p = 0.03) and is ahead, though not significantly, everywhere else.
 - The same dev gain (+3.2 vs +3.4) turned into different test gains. DPO trained on samples drawn once from the base model; GRPO drew fresh samples from the current model at every step. The fresh samples generalised better.
 
-Core experiments done. Open options: SFT redo with the fixed training code, distillation to 0.5B.
+## 6 Oct 2026: SFT redo on the model's own answers
+
+First run of the fixed SFT code (own pad token, loss on the answer only, fp16 LoRA instead of 4-bit). Data: one random correct sample per training problem, 6,711 examples, one epoch, 420 steps, learning rate 2e-4 cosine, 37 minutes. The mask check confirmed 267 of 370 tokens in the loss and `<|im_end|>` as the last trained token.
+
+- Dev accuracy stayed flat: base 85.4, checkpoints 84.4 to 85.0, every difference p > 0.5. Boxing, answer length and looping did not change either.
+- Gains on problems base solved 1 to 2 times out of 8 (+8) cancelled by losses on 3 to 5 (-5) and 6 to 7 (-3).
+- Training on the model's own correct answers gives it nothing new. GRPO and DPO got +3 on the same dev set from the same samples because they also see the wrong answers. Not taken to the test set since no checkpoint beat base on dev.
+
+## 7 Oct 2026: SFT redo on the R1 traces
+
+Same fixed code, 6,000 of the original R1 traces (median 2,606 tokens), one epoch, 375 steps at 30 seconds each, 3.2 hours. Mask check passed. Loss 0.80 to 0.51.
+
+- Dev accuracy 85.4 to 54.2 (p < 1e-30). Checkpoints range 52.6 to 56.2, so it is bad from step 100 onwards.
+- Same failure as the first SFT: a third of answers hit the 2,048-token limit, 90% of those are repetition loops, and only two thirds ever close `</think>`. Median answer 1,129 tokens against 277 for base.
+- Where it finishes it is still behind base on the same problems (82.6 vs 89.3). Base solves 78% of the problems it loops on.
+
+So the two code bugs were real but not the cause. A 1.5B model trained on long R1 traces copies the self-checking style without the ability to resolve it, and that produces loops no matter how the loss is set up. The SFT redo is closed: on its own answers it is flat, on R1 traces it is harmful, both on dev, neither taken to test.
